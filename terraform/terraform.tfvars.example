@@ -1,0 +1,12 @@
+project_id          = "your-gcp-project-id"
+region              = "us-central1"
+zone                = "us-central1-a"
+cluster_name        = "gke-inference-gw-cpu"
+machine_type        = "e2-standard-2"
+node_count          = 1
+disk_size_gb        = 30
+disk_type           = "pd-standard"
+node_subnet_cidr    = "10.10.0.0/24"
+pods_subnet_cidr    = "10.20.0.0/16"
+services_subnet_cidr = "10.30.0.0/20"
+proxy_subnet_cidr   = "10.10.1.0/24"
