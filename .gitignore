@@ -1,0 +1,41 @@
+# Terraform local state and caches
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# Keep example tfvars tracked
+!terraform.tfvars.example
+
+# OS and editor artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Temporary test outputs, logs, and local benchmark/metrics/streaming artifacts
+/tmp/
+*.log
+.results/
+.results/*
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
