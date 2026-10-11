@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-demo
+  namespace: default
+  labels:
+    app: qwen-demo
+    model-family: qwen2.5
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-demo
+  template:
+    metadata:
+      labels:
+        app: qwen-demo
+        model-family: qwen2.5
+        inference.networking.k8s.io/engine-type: llamacpp
+    spec:
+      initContainers:
+        - name: download-model
+          image: ghcr.io/ggml-org/llama.cpp:server@sha256:fc9b506e89c1a1cfdd7bc056480f54dc657c1c04d76839a08642dc280b8ed2f6
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              MODEL_PATH="/models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+              MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+              if [ ! -s "${MODEL_PATH}" ]; then
+                echo "Downloading Qwen2.5-0.5B-Instruct-GGUF (Q4_K_M)..."
+                curl -fL --retry 5 --retry-delay 3 -o "${MODEL_PATH}" "${MODEL_URL}"
+              fi
+              ls -lh "${MODEL_PATH}"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+      containers:
+        - name: llama-server
+          image: ghcr.io/ggml-org/llama.cpp:server@sha256:fc9b506e89c1a1cfdd7bc056480f54dc657c1c04d76839a08642dc280b8ed2f6
+          args:
+            - --model
+            - /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+            - --alias
+            - qwen-demo
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --ctx-size
+            - "2048"
+            - --parallel
+            - "2"
+            - --threads
+            - "2"
+            - --metrics
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: 1500m
+              memory: 1536Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+      volumes:
+        - name: model-weights
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-demo
+  namespace: default
+  labels:
+    app: qwen-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen-demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

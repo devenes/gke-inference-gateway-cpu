@@ -1,0 +1,1070 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auto-model-router-code
+  namespace: default
+  labels:
+    app: auto-model-router
+data:
+  classifier.py: |
+    #!/usr/bin/env python3
+    """Deterministic, explainable rule-based model classifier and request validator.
+
+    Supports two request modes behind a single OpenAI-compatible /v1/chat/completions endpoint:
+    - Mode A (Explicit model selection): Preserves recognized explicit model names
+      ('qwen-demo', 'smollm-demo') and rejects non-empty unknown models with HTTP 404.
+    - Mode B (Automatic model selection): When 'model' is absent, null, empty, or
+      whitespace-only, classifies the user messages using a deterministic rule engine:
+        1. code-request         -> qwen-demo
+        2. reasoning-request    -> qwen-demo
+        3. architecture-request -> qwen-demo
+        4. math-request         -> qwen-demo
+        5. long-input           -> qwen-demo (user chars > AUTO_ROUTER_LONG_INPUT_CHARS)
+        6. large-output         -> qwen-demo (max_tokens > AUTO_ROUTER_LONG_OUTPUT_TOKENS)
+        7. default-simple       -> smollm-demo
+    """
+
+    from __future__ import annotations
+
+    import dataclasses
+    import json
+    import os
+    import re
+    from typing import Any, Dict, List, Optional, Tuple
+
+    COMPLEX_MODEL = "qwen-demo"
+    SIMPLE_MODEL = "smollm-demo"
+    DEFAULT_RECOGNIZED_MODELS: Tuple[str, ...] = (COMPLEX_MODEL, SIMPLE_MODEL)
+
+    REASON_EXPLICIT_MODEL = "explicit-model"
+    REASON_CODE_REQUEST = "code-request"
+    REASON_REASONING_REQUEST = "reasoning-request"
+    REASON_ARCHITECTURE_REQUEST = "architecture-request"
+    REASON_MATH_REQUEST = "math-request"
+    REASON_LONG_INPUT = "long-input"
+    REASON_LARGE_OUTPUT = "large-output"
+    REASON_DEFAULT_SIMPLE = "default-simple"
+
+    VALID_ROLES = frozenset({"system", "user", "assistant", "developer", "tool"})
+
+
+    @dataclasses.dataclass(frozen=True)
+    class RouterConfig:
+        """Configuration and safety bounds for the rule-based automatic router."""
+
+        long_input_chars: int = 1200
+        long_output_tokens: int = 256
+        max_body_bytes: int = 65536
+        max_messages: int = 64
+        max_tokens_limit: int = 4096
+        complex_model: str = COMPLEX_MODEL
+        simple_model: str = SIMPLE_MODEL
+        recognized_models: Tuple[str, ...] = DEFAULT_RECOGNIZED_MODELS
+
+        @classmethod
+        def from_env(cls) -> "RouterConfig":
+            return cls(
+                long_input_chars=int(os.environ.get("AUTO_ROUTER_LONG_INPUT_CHARS", "1200")),
+                long_output_tokens=int(os.environ.get("AUTO_ROUTER_LONG_OUTPUT_TOKENS", "256")),
+                max_body_bytes=int(os.environ.get("AUTO_ROUTER_MAX_BODY_BYTES", "65536")),
+                max_messages=int(os.environ.get("AUTO_ROUTER_MAX_MESSAGES", "64")),
+                max_tokens_limit=int(os.environ.get("AUTO_ROUTER_MAX_TOKENS_LIMIT", "4096")),
+                complex_model=os.environ.get("AUTO_ROUTER_COMPLEX_MODEL", COMPLEX_MODEL),
+                simple_model=os.environ.get("AUTO_ROUTER_SIMPLE_MODEL", SIMPLE_MODEL),
+            )
+
+
+    @dataclasses.dataclass(frozen=True)
+    class RoutingDecision:
+        """Explainable routing decision produced for a validated request."""
+
+        selected_model: str
+        mode: str  # "explicit" or "auto"
+        reason: str
+        user_input_chars: int
+        requested_max_tokens: Optional[int]
+        stream: bool
+
+
+    class RequestValidationError(Exception):
+        """Structured HTTP validation error for malformed or unrecognized requests."""
+
+        def __init__(self, status_code: int, code: str, message: str) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+            self.code = code
+            self.message = message
+
+        def to_openai_error(self) -> Dict[str, Any]:
+            err_type = "not_found_error" if self.status_code == 404 else "invalid_request_error"
+            return {
+                "error": {
+                    "message": self.message,
+                    "type": err_type,
+                    "code": self.code,
+                }
+            }
+
+
+    # ---------------------------------------------------------------------------
+    # Compiled deterministic complexity patterns
+    # ---------------------------------------------------------------------------
+
+    CODE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+        # Markdown code fences or substantial inline code constructs
+        re.compile(r"```"),
+        re.compile(r"(?:^|\n)\s*(?:func\s+\w+\s*\(|package\s+main\b|def\s+[a-zA-Z_]\w*\s*\(|class\s+[a-zA-Z_]\w*[\s:(]|#include\s*<|SELECT\s+.+\s+FROM\s+.+\s+WHERE\s+)", re.IGNORECASE),
+        re.compile(r"(?:^|\n)\s*(?:apiVersion:\s*\S+|resource\s+\"[a-z0-9_]+\"\s+\"[a-z0-9_]+\")"),
+        # Code generation / implementation requests
+        re.compile(
+            r"\b(?:write|implement|create|generate|build|code|draft|develop)\b.{0,50}\b"
+            r"(?:program|script|function|class|method|module|cli|endpoint|microservice|sql\s+query|regex|regular\s+expression|unit\s+test|test\s+suite|dockerfile|makefile)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\b(?:write|implement|create|generate|code)\b.{0,35}\b(?:in|using)\s+"
+            r"(?:go|golang|python|javascript|typescript|rust|java|c\+\+|c#|bash|shell|zsh|sql|ruby|php)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\b(?:write|implement|generate)\s+(?:a|an)\s+"
+            r"(?:go|golang|python|javascript|typescript|rust|java|c\+\+|c#|bash|shell|sql)\b",
+            re.IGNORECASE,
+        ),
+        # Debugging, stack traces, refactoring, and code review
+        re.compile(
+            r"\b(?:debug|fix|troubleshoot|diagnose)\b.{0,45}\b"
+            r"(?:code|function|script|bug|error|exception|stack\s*trace|traceback|segfault|segmentation\s+fault|panic|crash|compile|compiler)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\b(?:stack\s*trace|traceback|nullpointerexception|segmentation\s+fault|syntaxerror|typeerror|keyerror|indexerror|panic:\s+runtime\s+error)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:refactor|code\s+review|review\s+this\s+(?:code|pr|pull\s+request|function)|optimize\s+this\s+(?:code|function|query|loop))\b",
+            re.IGNORECASE,
+        ),
+        # Infrastructure-as-code & Kubernetes manifest generation
+        re.compile(
+            r"\b(?:generate|write|create|build|draft|provide)\b.{0,55}\b"
+            r"(?:terraform|hcl|kubernetes\s+manifest|k8s\s+manifest|deployment\s+yaml|helm\s+chart|docker-compose|github\s+actions|ci/cd\s+pipeline|yaml\s+manifest|manifest\s+for)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\b(?:terraform\s+(?:configuration|module|resource|provider\s+block|state\s+migration)|"
+            r"kubernetes\s+(?:deployment|service|ingress|httproute|gateway|statefulset|daemonset)\s+(?:yaml|manifest|spec))\b",
+            re.IGNORECASE,
+        ),
+    )
+
+    REASONING_PATTERNS: Tuple[re.Pattern[str], ...] = (
+        re.compile(
+            r"\b(?:step\s+by\s+step|step-by-step|chain\s+of\s+thought|chain-of-thought|"
+            r"walk\s+me\s+through\s+each\s+step|think\s+through\s+carefully|from\s+first\s+principles|"
+            r"multi-step\s+reasoning|show\s+every\s+step|explain\s+each\s+step\s+in\s+detail)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:formal\s+proof|mathematical\s+induction|prove\s+that|logical\s+deduction|"
+            r"deduce\s+which|solve\s+this\s+(?:logic\s+)?puzzle|syllogism)\b",
+            re.IGNORECASE,
+        ),
+    )
+
+    ARCHITECTURE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+        re.compile(
+            r"\b(?:trade-off|trade-offs|tradeoff|tradeoffs|pros\s+and\s+cons)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:compare|comparison|contrast)\b.{0,65}\b"
+            r"(?:architecture|architectures|design|designs|topology|topologies|approach|approaches|"
+            r"pattern|patterns|protocol|protocols|strategy|strategies|networking)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\b(?:architecture\s+design|system\s+design|design\s+a\s+(?:distributed|scalable|high-availability|fault-tolerant|multi-region|microservices)|"
+            r"root-cause\s+analysis|root\s+cause\s+analysis|postmortem|failure\s+mode\s+analysis|"
+            r"cap\s+theorem|consensus\s+algorithm|algorithm\s+design|time\s+and\s+space\s+complexity|big-o\s+complexity)\b",
+            re.IGNORECASE,
+        ),
+    )
+
+    MATH_PATTERNS: Tuple[re.Pattern[str], ...] = (
+        # Multi-operator arithmetic or parenthesized mathematical expressions
+        re.compile(r"\b\d+(?:\.\d+)?\s*[\*\/+\-\^]\s*\d+(?:\.\d+)?\s*[\*\/+\-\^=]\s*\d+"),
+        re.compile(r"\(\s*\d+(?:\.\d+)?\s*[\*\/+\-\^]\s*\d+(?:\.\d+)?\s*\)\s*[\*\/+\-\^]"),
+        re.compile(r"\b\d{2,}\s*[\*\/]\s*\d{2,}\b"),
+        # Explicit mathematical problem-solving keywords
+        re.compile(
+            r"\b(?:calculate|compute|solve\s+for|evaluate\s+the\s+(?:integral|derivative|expression|limit|sum)|"
+            r"integrate\s+|derivative\s+of|differential\s+equation|eigenvalue|eigenvector|"
+            r"matrix\s+multiplication|standard\s+deviation|probability\s+of|binomial\s+distribution|"
+            r"bayes(?:'|\s)?\s*theorem|compound\s+interest|quadratic\s+equation|system\s+of\s+equations|linear\s+algebra)\b",
+            re.IGNORECASE,
+        ),
+    )
+
+
+    def _extract_message_text(msg: Any, index: int) -> Tuple[str, str]:
+        """Validate a single OpenAI chat message and return (role, extracted_text)."""
+        if not isinstance(msg, dict):
+            raise RequestValidationError(
+                400,
+                "malformed_messages",
+                f"messages[{index}] must be a JSON object.",
+            )
+
+        role = msg.get("role")
+        if not isinstance(role, str) or role not in VALID_ROLES:
+            raise RequestValidationError(
+                400,
+                "malformed_messages",
+                f"messages[{index}].role must be one of {sorted(VALID_ROLES)}.",
+            )
+
+        if "content" not in msg:
+            raise RequestValidationError(
+                400,
+                "malformed_messages",
+                f"messages[{index}].content is required.",
+            )
+
+        content = msg.get("content")
+        if content is None:
+            if role in {"assistant", "tool"}:
+                return role, ""
+            raise RequestValidationError(
+                400,
+                "malformed_messages",
+                f"messages[{index}].content cannot be null for role '{role}'.",
+            )
+
+        if isinstance(content, str):
+            return role, content
+
+        if isinstance(content, list):
+            if not content:
+                raise RequestValidationError(
+                    400,
+                    "malformed_messages",
+                    f"messages[{index}].content array must not be empty.",
+                )
+            text_parts: List[str] = []
+            for p_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    raise RequestValidationError(
+                        400,
+                        "malformed_messages",
+                        f"messages[{index}].content[{p_idx}] must be an object.",
+                    )
+                p_type = part.get("type", "text")
+                if p_type == "text":
+                    p_text = part.get("text")
+                    if not isinstance(p_text, str):
+                        raise RequestValidationError(
+                            400,
+                            "malformed_messages",
+                            f"messages[{index}].content[{p_idx}].text must be a string.",
+                        )
+                    text_parts.append(p_text)
+            return role, "\n".join(text_parts)
+
+        raise RequestValidationError(
+            400,
+            "malformed_messages",
+            f"messages[{index}].content must be a string or array of content parts.",
+        )
+
+
+    def classify_user_input(
+        user_text: str,
+        requested_max_tokens: Optional[int] = None,
+        config: Optional[RouterConfig] = None,
+    ) -> Tuple[str, str]:
+        """Deterministically classify user input into (selected_model, reason_code).
+
+        Evaluation precedence:
+          1. code-request         -> qwen-demo
+          2. reasoning-request    -> qwen-demo
+          3. architecture-request -> qwen-demo
+          4. math-request         -> qwen-demo
+          5. long-input           -> qwen-demo (len(user_text) > config.long_input_chars)
+          6. large-output         -> qwen-demo (requested_max_tokens > config.long_output_tokens)
+          7. default-simple       -> smollm-demo
+        """
+        cfg = config or RouterConfig()
+
+        for pattern in CODE_PATTERNS:
+            if pattern.search(user_text):
+                return cfg.complex_model, REASON_CODE_REQUEST
+
+        for pattern in REASONING_PATTERNS:
+            if pattern.search(user_text):
+                return cfg.complex_model, REASON_REASONING_REQUEST
+
+        for pattern in ARCHITECTURE_PATTERNS:
+            if pattern.search(user_text):
+                return cfg.complex_model, REASON_ARCHITECTURE_REQUEST
+
+        for pattern in MATH_PATTERNS:
+            if pattern.search(user_text):
+                return cfg.complex_model, REASON_MATH_REQUEST
+
+        if len(user_text) > cfg.long_input_chars:
+            return cfg.complex_model, REASON_LONG_INPUT
+
+        if requested_max_tokens is not None and requested_max_tokens > cfg.long_output_tokens:
+            return cfg.complex_model, REASON_LARGE_OUTPUT
+
+        return cfg.simple_model, REASON_DEFAULT_SIMPLE
+
+
+    def evaluate_chat_request(
+        raw_body: bytes,
+        config: Optional[RouterConfig] = None,
+    ) -> Tuple[RoutingDecision, bytes]:
+        """Parse, validate, and classify an OpenAI /v1/chat/completions request body.
+
+        Returns (RoutingDecision, forwarded_json_bytes) where forwarded_json_bytes
+        is guaranteed to contain the resolved 'model' identifier.
+        Raises RequestValidationError (HTTP 400 or 404) on invalid input or unknown model.
+        """
+        cfg = config or RouterConfig()
+
+        if not raw_body:
+            raise RequestValidationError(400, "empty_body", "Request body must not be empty.")
+
+        if len(raw_body) > cfg.max_body_bytes:
+            raise RequestValidationError(
+                400,
+                "payload_too_large",
+                f"Request body size ({len(raw_body)} bytes) exceeds maximum allowed ({cfg.max_body_bytes} bytes).",
+            )
+
+        try:
+            decoded = raw_body.decode("utf-8")
+            payload = json.loads(decoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestValidationError(400, "invalid_json", f"Invalid JSON request body: {exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise RequestValidationError(400, "invalid_json_object", "Top-level JSON body must be an object.")
+
+        # Validate messages array
+        if "messages" not in payload:
+            raise RequestValidationError(400, "missing_messages", "Field 'messages' is required.")
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or len(messages) == 0:
+            raise RequestValidationError(400, "malformed_messages", "Field 'messages' must be a non-empty array.")
+
+        if len(messages) > cfg.max_messages:
+            raise RequestValidationError(
+                400,
+                "too_many_messages",
+                f"Field 'messages' contains {len(messages)} items, exceeding limit of {cfg.max_messages}.",
+            )
+
+        user_texts: List[str] = []
+        for idx, msg in enumerate(messages):
+            role, text = _extract_message_text(msg, idx)
+            if role == "user":
+                user_texts.append(text)
+
+        if not user_texts or not any(t.strip() for t in user_texts):
+            raise RequestValidationError(
+                400,
+                "malformed_messages",
+                "Field 'messages' must include at least one non-empty 'user' message.",
+            )
+
+        # Aggregate user messages (system/assistant messages are intentionally excluded from user input length)
+        combined_user_text = "\n".join(user_texts)
+        user_input_chars = len(combined_user_text)
+
+        # Validate optional max_tokens / max_completion_tokens
+        requested_max_tokens: Optional[int] = None
+        for tok_field in ("max_tokens", "max_completion_tokens"):
+            if tok_field in payload and payload[tok_field] is not None:
+                val = payload[tok_field]
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise RequestValidationError(
+                        400,
+                        "invalid_max_tokens",
+                        f"Field '{tok_field}' must be a positive integer.",
+                    )
+                if val <= 0 or val > cfg.max_tokens_limit:
+                    raise RequestValidationError(
+                        400,
+                        "invalid_max_tokens",
+                        f"Field '{tok_field}' must be between 1 and {cfg.max_tokens_limit}.",
+                    )
+                if requested_max_tokens is None:
+                    requested_max_tokens = val
+
+        # Validate optional stream flag
+        stream_val = payload.get("stream", False)
+        if stream_val is not None and not isinstance(stream_val, bool):
+            raise RequestValidationError(400, "invalid_stream_flag", "Field 'stream' must be a boolean.")
+        stream = bool(stream_val)
+
+        # Evaluate model field with strict precedence
+        has_model_key = "model" in payload
+        model_val = payload.get("model")
+
+        if has_model_key and model_val is not None:
+            if isinstance(model_val, bool) or not isinstance(model_val, str):
+                raise RequestValidationError(
+                    400,
+                    "invalid_model_type",
+                    "Field 'model' must be a string or null when provided.",
+                )
+            if model_val.strip() != "":
+                # Non-empty explicit model: must match a recognized model identifier exactly
+                if model_val in cfg.recognized_models:
+                    decision = RoutingDecision(
+                        selected_model=model_val,
+                        mode="explicit",
+                        reason=REASON_EXPLICIT_MODEL,
+                        user_input_chars=user_input_chars,
+                        requested_max_tokens=requested_max_tokens,
+                        stream=stream,
+                    )
+                    payload["model"] = decision.selected_model
+                    return decision, json.dumps(payload).encode("utf-8")
+
+                raise RequestValidationError(
+                    404,
+                    "model_not_found",
+                    f"Model '{model_val}' does not exist. Recognized models: {', '.join(cfg.recognized_models)}.",
+                )
+
+        # Model is absent, null, empty, or whitespace-only -> run deterministic rule classifier
+        selected_model, reason = classify_user_input(
+            user_text=combined_user_text,
+            requested_max_tokens=requested_max_tokens,
+            config=cfg,
+        )
+        decision = RoutingDecision(
+            selected_model=selected_model,
+            mode="auto",
+            reason=reason,
+            user_input_chars=user_input_chars,
+            requested_max_tokens=requested_max_tokens,
+            stream=stream,
+        )
+        payload["model"] = decision.selected_model
+        forwarded_bytes = json.dumps(payload).encode("utf-8")
+        return decision, forwarded_bytes
+  server.py: |
+    #!/usr/bin/env python3
+    """Lightweight HTTP server for rule-based automatic model routing on GKE.
+
+    Exposes:
+    - GET  /health               -> HTTP 200 {"status": "ok"}
+    - POST /v1/chat/completions  -> Validates & classifies request, injects selected
+                                    'model' field, and forwards to internal ClusterIP
+                                    model service with full SSE streaming support.
+    """
+
+    from __future__ import annotations
+
+    import datetime
+    import http.client
+    import http.server
+    import json
+    import os
+    import socket
+    import sys
+    import time
+    import urllib.parse
+    import uuid
+    from typing import Dict, Optional, Tuple
+
+    try:
+        from router.classifier import (
+            COMPLEX_MODEL,
+            SIMPLE_MODEL,
+            RequestValidationError,
+            RouterConfig,
+             evaluate_chat_request,
+        )
+    except ImportError:
+        from classifier import (  # type: ignore
+            COMPLEX_MODEL,
+            SIMPLE_MODEL,
+            RequestValidationError,
+            RouterConfig,
+            evaluate_chat_request,
+        )
+
+
+    def log_json(event: Dict[str, object]) -> None:
+        """Emit a single-line structured JSON log without any prompt or completion content."""
+        record = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            **event,
+        }
+        sys.stdout.write(json.dumps(record) + "\n")
+        sys.stdout.flush()
+
+
+    class RouterServerConfig:
+        """Runtime server and upstream endpoint configuration."""
+
+        def __init__(
+            self,
+            router_config: Optional[RouterConfig] = None,
+            model_upstreams: Optional[Dict[str, str]] = None,
+            upstream_timeout_sec: float = 90.0,
+        ) -> None:
+            self.router_config = router_config or RouterConfig.from_env()
+            self.upstream_timeout_sec = float(
+                os.environ.get("AUTO_ROUTER_UPSTREAM_TIMEOUT_SEC", str(upstream_timeout_sec))
+            )
+            default_upstreams = {
+                COMPLEX_MODEL: os.environ.get(
+                    "AUTO_ROUTER_QWEN_UPSTREAM",
+                    "http://qwen-demo.default.svc.cluster.local:8080",
+                ),
+                SIMPLE_MODEL: os.environ.get(
+                    "AUTO_ROUTER_SMOLLM_UPSTREAM",
+                    "http://smollm-demo.default.svc.cluster.local:8080",
+                ),
+            }
+            self.model_upstreams = model_upstreams or default_upstreams
+
+        def resolve_upstream(self, model_name: str) -> Tuple[str, int, str]:
+            raw_url = self.model_upstreams.get(model_name)
+            if not raw_url:
+                raise KeyError(f"No upstream configured for model '{model_name}'")
+            parsed = urllib.parse.urlparse(raw_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            base_path = parsed.path.rstrip("/")
+            return host, port, base_path
+
+
+    class AutoModelRouterHandler(http.server.BaseHTTPRequestHandler):
+        """HTTP/1.1 handler supporting both JSON and incremental SSE responses."""
+
+        protocol_version = "HTTP/1.1"
+        server_config: RouterServerConfig = RouterServerConfig()
+
+        def log_message(self, format: str, *args: object) -> None:
+            # Suppress default BaseHTTPRequestHandler stderr access log in favor of structured JSON logs
+            return
+
+        def _get_request_id(self) -> str:
+            for hdr in ("X-Request-Id", "X-Correlation-Id"):
+                val = self.headers.get(hdr)
+                if val and val.strip():
+                    return val.strip()[:128]
+            return str(uuid.uuid4())
+
+        def _send_json(
+            self,
+            status_code: int,
+            payload: Dict[str, object],
+            extra_headers: Optional[Dict[str, str]] = None,
+        ) -> None:
+            body = (json.dumps(payload) + "\n").encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+
+        def _read_bounded_body(self, max_bytes: int) -> bytes:
+            """Read request body up to max_bytes + 1 so oversized payloads are caught safely."""
+            transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+            if "chunked" in transfer_encoding:
+                chunks = bytearray()
+                while True:
+                    line = self.rfile.readline(65536)
+                    if not line:
+                        break
+                    size_str = line.split(b";", 1)[0].strip()
+                    try:
+                        chunk_len = int(size_str, 16)
+                    except ValueError as exc:
+                        raise RequestValidationError(400, "invalid_chunked_body", "Malformed chunked encoding.") from exc
+                    if chunk_len == 0:
+                        # Consume trailing CRLF
+                        self.rfile.readline(65536)
+                        break
+                    if len(chunks) + chunk_len > max_bytes:
+                        raise RequestValidationError(
+                            400,
+                            "payload_too_large",
+                            f"Request body exceeds maximum allowed ({max_bytes} bytes).",
+                        )
+                    data = self.rfile.read(chunk_len)
+                    chunks.extend(data)
+                    # Consume trailing CRLF after chunk
+                    self.rfile.readline(65536)
+                return bytes(chunks)
+
+            content_length_hdr = self.headers.get("Content-Length")
+            if content_length_hdr is None:
+                raise RequestValidationError(400, "missing_content_length", "Content-Length header is required.")
+            try:
+                content_length = int(content_length_hdr)
+            except ValueError as exc:
+                raise RequestValidationError(400, "invalid_content_length", "Invalid Content-Length header.") from exc
+
+            if content_length < 0:
+                raise RequestValidationError(400, "invalid_content_length", "Negative Content-Length is invalid.")
+
+            if content_length > max_bytes:
+                # Read only a small drain window and close connection to avoid buffering huge bodies
+                raise RequestValidationError(
+                    400,
+                    "payload_too_large",
+                    f"Request body size ({content_length} bytes) exceeds maximum allowed ({max_bytes} bytes).",
+                )
+
+            if content_length == 0:
+                return b""
+
+            return self.rfile.read(content_length)
+
+        def do_GET(self) -> None:
+            parsed_path = urllib.parse.urlparse(self.path).path
+            if parsed_path in ("/health", "/healthz"):
+                self._send_json(200, {"status": "ok", "service": "auto-model-router"})
+                return
+            self._send_json(
+                404,
+                {
+                    "error": {
+                        "message": f"Unknown path '{parsed_path}'. Use POST /v1/chat/completions.",
+                        "type": "not_found_error",
+                        "code": "path_not_found",
+                    }
+                },
+            )
+
+        def do_POST(self) -> None:
+            start_time = time.monotonic()
+            req_id = self._get_request_id()
+            parsed_path = urllib.parse.urlparse(self.path).path
+
+            if parsed_path != "/v1/chat/completions":
+                self._send_json(
+                    404,
+                    {
+                        "error": {
+                            "message": f"Unknown endpoint '{parsed_path}'. Expected '/v1/chat/completions'.",
+                            "type": "not_found_error",
+                            "code": "endpoint_not_found",
+                        }
+                    },
+                    extra_headers={"X-Request-Id": req_id},
+                )
+                return
+
+            cfg = self.server_config.router_config
+
+            try:
+                raw_body = self._read_bounded_body(cfg.max_body_bytes)
+                decision, forwarded_body = evaluate_chat_request(raw_body, cfg)
+            except RequestValidationError as exc:
+                dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                log_json(
+                    {
+                        "level": "warn",
+                        "msg": "request rejected",
+                        "request_id": req_id,
+                        "status": exc.status_code,
+                        "error_code": exc.code,
+                        "duration_ms": dur_ms,
+                    }
+                )
+                self._send_json(
+                    exc.status_code,
+                    exc.to_openai_error(),
+                    extra_headers={"X-Request-Id": req_id},
+                )
+                return
+            except Exception as exc:
+                dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                log_json(
+                    {
+                        "level": "error",
+                        "msg": "unexpected validation error",
+                        "request_id": req_id,
+                        "error": str(exc),
+                        "duration_ms": dur_ms,
+                    }
+                )
+                self._send_json(
+                    400,
+                    {
+                        "error": {
+                            "message": "Malformed request.",
+                            "type": "invalid_request_error",
+                            "code": "malformed_request",
+                        }
+                    },
+                    extra_headers={"X-Request-Id": req_id},
+                )
+                return
+
+            route_headers = {
+                "X-Auto-Selected-Model": decision.selected_model,
+                "X-Auto-Route-Reason": decision.reason,
+                "X-Auto-Route-Mode": decision.mode,
+                "X-Request-Id": req_id,
+            }
+
+            try:
+                up_host, up_port, up_base_path = self.server_config.resolve_upstream(decision.selected_model)
+            except KeyError as exc:
+                self._send_json(
+                    502,
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "server_error",
+                            "code": "upstream_not_configured",
+                        }
+                    },
+                    extra_headers=route_headers,
+                )
+                return
+
+            upstream_target = f"{up_base_path}/v1/chat/completions"
+            conn: Optional[http.client.HTTPConnection] = None
+
+            try:
+                conn = http.client.HTTPConnection(
+                    up_host,
+                    up_port,
+                    timeout=self.server_config.upstream_timeout_sec,
+                )
+                up_req_headers = {
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(forwarded_body)),
+                    "Accept": self.headers.get("Accept", "*/*"),
+                    "X-Request-Id": req_id,
+                }
+                conn.request("POST", upstream_target, body=forwarded_body, headers=up_req_headers)
+                up_resp = conn.getresponse()
+                up_status = up_resp.status
+                up_content_type = up_resp.getheader("Content-Type", "application/json")
+                is_sse = decision.stream or up_content_type.lower().startswith("text/event-stream")
+
+                if is_sse and up_status == 200:
+                    self.send_response(up_status)
+                    self.send_header("Content-Type", up_content_type)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("Connection", "close")
+                    for k, v in route_headers.items():
+                        self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.flush()
+
+                    chunks_forwarded = 0
+                    while True:
+                        line = up_resp.readline()
+                        if not line:
+                            break
+                        chunk_header = f"{len(line):X}\r\n".encode("ascii")
+                        self.wfile.write(chunk_header)
+                        self.wfile.write(line)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                        chunks_forwarded += 1
+
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+
+                    dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                    log_json(
+                        {
+                            "level": "info",
+                            "msg": "routed chat completion request",
+                            "request_id": req_id,
+                            "mode": decision.mode,
+                            "selected_model": decision.selected_model,
+                            "reason": decision.reason,
+                            "stream": True,
+                            "user_input_chars": decision.user_input_chars,
+                            "requested_max_tokens": decision.requested_max_tokens,
+                            "upstream": f"{up_host}:{up_port}",
+                            "status": up_status,
+                            "sse_lines_forwarded": chunks_forwarded,
+                            "duration_ms": dur_ms,
+                        }
+                    )
+                else:
+                    resp_body = up_resp.read()
+                    self.send_response(up_status)
+                    self.send_header("Content-Type", up_content_type)
+                    self.send_header("Content-Length", str(len(resp_body)))
+                    self.send_header("Connection", "close")
+                    for k, v in route_headers.items():
+                        self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    self.wfile.flush()
+
+                    dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                    log_json(
+                        {
+                            "level": "info",
+                            "msg": "routed chat completion request",
+                            "request_id": req_id,
+                            "mode": decision.mode,
+                            "selected_model": decision.selected_model,
+                            "reason": decision.reason,
+                            "stream": False,
+                            "user_input_chars": decision.user_input_chars,
+                            "requested_max_tokens": decision.requested_max_tokens,
+                            "upstream": f"{up_host}:{up_port}",
+                            "status": up_status,
+                            "response_bytes": len(resp_body),
+                            "duration_ms": dur_ms,
+                        }
+                    )
+            except (socket.timeout, TimeoutError) as exc:
+                dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                log_json(
+                    {
+                        "level": "error",
+                        "msg": "upstream request timed out",
+                        "request_id": req_id,
+                        "mode": decision.mode,
+                        "selected_model": decision.selected_model,
+                        "reason": decision.reason,
+                        "upstream": f"{up_host}:{up_port}",
+                        "error": str(exc),
+                        "duration_ms": dur_ms,
+                    }
+                )
+                self._send_json(
+                    504,
+                    {
+                        "error": {
+                            "message": f"Upstream model server '{decision.selected_model}' timed out.",
+                            "type": "upstream_error",
+                            "code": "upstream_timeout",
+                        }
+                    },
+                    extra_headers=route_headers,
+                )
+            except Exception as exc:
+                dur_ms = round((time.monotonic() - start_time) * 1000.0, 2)
+                log_json(
+                    {
+                        "level": "error",
+                        "msg": "upstream request failed",
+                        "request_id": req_id,
+                        "mode": decision.mode,
+                        "selected_model": decision.selected_model,
+                        "reason": decision.reason,
+                        "upstream": f"{up_host}:{up_port}",
+                        "error": str(exc),
+                        "duration_ms": dur_ms,
+                    }
+                )
+                try:
+                    self._send_json(
+                        502,
+                        {
+                            "error": {
+                                "message": f"Failed to reach upstream model server '{decision.selected_model}': {exc}",
+                                "type": "upstream_error",
+                                "code": "upstream_unavailable",
+                            }
+                        },
+                        extra_headers=route_headers,
+                    )
+                except Exception:
+                    pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+
+    def run_server(host: str = "0.0.0.0", port: int = 8080) -> None:
+        server_cfg = RouterServerConfig()
+        AutoModelRouterHandler.server_config = server_cfg
+        httpd = http.server.ThreadingHTTPServer((host, port), AutoModelRouterHandler)
+        log_json(
+            {
+                "level": "info",
+                "msg": "auto-model-router listening",
+                "host": host,
+                "port": port,
+                "long_input_chars": server_cfg.router_config.long_input_chars,
+                "long_output_tokens": server_cfg.router_config.long_output_tokens,
+                "max_body_bytes": server_cfg.router_config.max_body_bytes,
+                "upstreams": server_cfg.model_upstreams,
+            }
+        )
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+
+
+    if __name__ == "__main__":
+        listen_port = int(os.environ.get("PORT", "8080"))
+        run_server(host="0.0.0.0", port=listen_port)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auto-model-router
+  namespace: default
+  labels:
+    app: auto-model-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auto-model-router
+  template:
+    metadata:
+      labels:
+        app: auto-model-router
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: router
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-u", "/app/server.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: AUTO_ROUTER_LONG_INPUT_CHARS
+              value: "1200"
+            - name: AUTO_ROUTER_LONG_OUTPUT_TOKENS
+              value: "256"
+            - name: AUTO_ROUTER_MAX_BODY_BYTES
+              value: "65536"
+            - name: AUTO_ROUTER_MAX_MESSAGES
+              value: "64"
+            - name: AUTO_ROUTER_MAX_TOKENS_LIMIT
+              value: "4096"
+            - name: AUTO_ROUTER_QWEN_UPSTREAM
+              value: "http://qwen-demo.default.svc.cluster.local:8080"
+            - name: AUTO_ROUTER_SMOLLM_UPSTREAM
+              value: "http://smollm-demo.default.svc.cluster.local:8080"
+            - name: AUTO_ROUTER_UPSTREAM_TIMEOUT_SEC
+              value: "90"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          volumeMounts:
+            - name: router-code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: router-code
+          configMap:
+            name: auto-model-router-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auto-model-router
+  namespace: default
+  labels:
+    app: auto-model-router
+spec:
+  type: ClusterIP
+  selector:
+    app: auto-model-router
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: auto-model-router
+  namespace: default
+  labels:
+    app: auto-model-router
+spec:
+  default:
+    checkIntervalSec: 2
+    timeoutSec: 2
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 8080
+        requestPath: /health
+  targetRef:
+    group: ""
+    kind: Service
+    name: auto-model-router
+---
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: auto-model-router
+  namespace: default
+  labels:
+    app: auto-model-router
+spec:
+  default:
+    timeoutSec: 120
+    logging:
+      enabled: true
+  targetRef:
+    group: ""
+    kind: Service
+    name: auto-model-router

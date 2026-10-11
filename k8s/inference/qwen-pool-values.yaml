@@ -1,0 +1,69 @@
+inferencePool:
+  targetPorts:
+    - number: 8080
+  modelServerProtocol: http
+  modelServers:
+    matchLabels:
+      app: qwen-demo
+
+inferenceExtension:
+  replicas: 1
+  image:
+    registry: registry.k8s.io
+    repository: gateway-api-inference-extension/epp
+    tag: v1.5.0
+    pullPolicy: IfNotPresent
+  extProcPort: 9002
+  failureMode: "FailOpen"
+  pluginsConfigFile: "llamacpp-plugins.yaml"
+  pluginsCustomConfig:
+    llamacpp-plugins.yaml: |
+      apiVersion: inference.networking.x-k8s.io/v1alpha1
+      kind: EndpointPickerConfig
+      plugins:
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: metrics-data-source
+        parameters:
+          scheme: "http"
+          path: "/metrics"
+          insecureSkipVerify: true
+      - type: core-metrics-extractor
+        parameters:
+          defaultEngine: llamacpp
+          engineConfigs:
+          - name: llamacpp
+            queuedRequestsSpec: "llamacpp:requests_deferred"
+            runningRequestsSpec: "llamacpp:requests_processing"
+            kvUsageSpec: ""
+            loraSpec: ""
+            cacheInfoSpec: ""
+      schedulingProfiles:
+      - name: default
+        plugins:
+        - pluginRef: queue-scorer
+          weight: 2
+        - pluginRef: kv-cache-utilization-scorer
+          weight: 2
+        - pluginRef: prefix-cache-scorer
+          weight: 3
+  flags:
+    v: 2
+  monitoring:
+    prometheus:
+      enabled: false
+      auth:
+        enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+provider:
+  name: gke
+  gke:
+    autopilot: false
