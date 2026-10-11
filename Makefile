@@ -4,7 +4,7 @@ ZONE         ?= us-central1-a
 CLUSTER_NAME ?= gke-inference-gw-cpu
 TF_DIR       := terraform
 
-.PHONY: help preflight init fmt validate plan infra credentials deploy status test test-classifier test-auto-routing test-streaming metrics benchmark diagnostics logs destroy
+.PHONY: help preflight init fmt validate lint plan infra credentials deploy status test test-classifier test-unit test-auto-routing test-streaming metrics benchmark diagnostics logs destroy
 
 help: ## Show available Makefile targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -20,6 +20,14 @@ fmt: ## Check Terraform formatting
 
 validate: init ## Validate Terraform configuration
 	terraform -chdir=$(TF_DIR) validate
+
+lint: ## Run Python, Terraform, shell, and YAML linters
+	@ruff check router/
+	@terraform -chdir=$(TF_DIR) fmt -check
+	@shellcheck scripts/*.sh
+	@python3 -m yamllint -c .yamllint.yaml k8s/ .github/
+
+test-unit: test-classifier ## Run local router unit and contract tests
 
 plan: init ## Run Terraform plan
 	terraform -chdir=$(TF_DIR) plan \

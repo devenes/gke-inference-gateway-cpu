@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import http.client
 import http.server
-import io
 import json
 import threading
 import unittest

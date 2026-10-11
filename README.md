@@ -2,6 +2,7 @@
 
 A CPU-only Google Kubernetes Engine (GKE) demo that serves two small GGUF language models behind one OpenAI-compatible endpoint. It combines explicit model routing through the [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) with deterministic, rule-based model selection when the request does not specify a model.
 
+[![CI](https://github.com/devenes/gke-inference-gateway-cpu/actions/workflows/ci.yml/badge.svg)](https://github.com/devenes/gke-inference-gateway-cpu/actions/workflows/ci.yml)
 [![GKE Standard](https://img.shields.io/badge/GKE-v1.35%20Standard%20%7C%20CPU--only-4285F4?logo=googlekubernetesengine&logoColor=white)](https://cloud.google.com/kubernetes-engine)
 [![Inference Gateway](https://img.shields.io/badge/Inference%20Extension-v1.5.0-326CE5?logo=kubernetes&logoColor=white)](https://github.com/kubernetes-sigs/gateway-api-inference-extension)
 [![Models](https://img.shields.io/badge/Models-Qwen2.5--0.5B%20%26%20SmolLM2--360M-FF9D00?logo=huggingface&logoColor=white)](https://huggingface.co)
@@ -45,8 +46,9 @@ Run the commands from the repository root:
 # 1. Check local tools, authentication, project access, and billing
 make preflight
 
-# 2. Run local router unit and HTTP/SSE contract tests (no cluster required)
-make test-classifier
+# 2. Run local linters and unit/contract tests (no cluster required)
+make lint
+make test-unit
 
 # 3. Provision the VPC, proxy-only subnet, firewall, IAM, and GKE cluster
 make infra

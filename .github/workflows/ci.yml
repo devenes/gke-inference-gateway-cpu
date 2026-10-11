@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-router:
+    name: Router Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run router unit and contract tests
+        run: |
+          python3 -m unittest discover -s router -p "test_*.py" -v
+
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install linters
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Check Python bytecode compilation
+        run: |
+          python3 -m py_compile router/*.py
+
+      - name: Run Ruff check
+        run: |
+          ruff check router/
+
+  terraform:
+    name: Terraform Check & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Check Terraform formatting
+        run: |
+          terraform -chdir=terraform fmt -check
+
+      - name: Initialize Terraform (backend-disabled)
+        run: |
+          terraform -chdir=terraform init -backend=false
+
+      - name: Validate Terraform configuration
+        run: |
+          terraform -chdir=terraform validate
+
+  shellcheck:
+    name: Shell Scripts Lint & Syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check bash syntax
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck scripts/*.sh
+
+  yaml-lint:
+    name: Lint YAML Manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install yamllint
+        run: |
+          pip install yamllint
+
+      - name: Run yamllint
+        run: |
+          yamllint -c .yamllint.yaml k8s/ .github/
+
+  ci-status:
+    name: CI Status Gate
+    needs:
+      - test-router
+      - lint-python
+      - terraform
+      - shellcheck
+      - yaml-lint
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check overall CI status
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more required CI jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All CI jobs passed successfully!"
