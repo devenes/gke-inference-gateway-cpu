@@ -19,7 +19,7 @@ This document records the live end-to-end verification, SSE streaming Time-to-Fi
 
 ## 2. Live Auto-Routing Verification Matrix (`make test-auto-routing`)
 
-Observed live test run against `http://35.209.207.194/v1/chat/completions` (`.results/auto-routing/20261011-212314/summary.md`):
+Observed live test run against `http://<GATEWAY_IP>/v1/chat/completions` (`.results/auto-routing/20261011-212314/summary.md`):
 
 | Test Case | Request `model` Field | Expected Route / Model | HTTP Status | Response `.model` | `X-Auto-Selected-Model` | `X-Auto-Route-Reason` | Latency (s) | Result |
 | :--- | :--- | :--- | :---: | :--- | :--- | :--- | ---: | :---: |
@@ -80,7 +80,7 @@ sequenceDiagram
 
 ## 4. End-to-End Inference Benchmark (`make benchmark`)
 
-`scripts/benchmark.sh` (`make benchmark`) runs a conservative, reproducible benchmark through the **public GKE Gateway** (`http://35.209.207.194/v1/chat/completions`), never bypassing the Gateway or Body-Based Router:
+`scripts/benchmark.sh` (`make benchmark`) runs a conservative, reproducible benchmark through the **public GKE Gateway** (`http://<GATEWAY_IP>/v1/chat/completions`), never bypassing the Gateway or Body-Based Router:
 - `1` warm-up request per model (recorded in `requests.csv` as `mode=warmup`, excluded from summary statistics).
 - `5` sequential measured requests per model (`max_tokens=64`, `temperature=0.0`).
 - `4` bounded concurrent measured requests per model at `concurrency=2`.
